@@ -2,6 +2,7 @@
 # Large raster data (optional – keep if <100 MB)
 # -------------------------------------------------
 data
+output
 
 # -------------------------------------------------
 # Ignore secrets.py
