@@ -302,82 +302,213 @@ def clip(scene_path, out_path, geometries, nodata=-9999.0): #use a numeric nodat
 # CO-REGISTRATION VALIDAYION
 # -----------------------------
 
-def validate_coregistration(pre_fire_path, post_fire_path, sample_n=1000):
-    """ 
-    Verify that pre and post-fire images are properly aligned
+def validate_coregistration(pre_fire_path, post_fire_path,
+                             scl_pre_path=None, scl_post_path=None,
+                             sample_n=1000, nodata=-9999.0):
     """
-    
-    print("\n" + "="*70)
-    print("CO-REGISTRATION VALIDATION")
-    print("="*70)
+    Verify that pre and post-fire images are properly aligned.
 
+    v2 improvements:
+      1. Compares rasterio transforms directly (geometric check).
+      2. Uses SCL masks to sample only stable land-cover classes
+         (vegetation, bare soil, water) — excludes burned, cloud, shadow.
+      3. Cross-correlation window avoids burned areas.
+      4. Normalizes windows to reduce brightness-change effects.
+      5. Works on both full tiles and clipped images.
+
+    Args:
+        pre_fire_path:  path to pre-fire B8A raster (.jp2 or .tiff)
+        post_fire_path: path to post-fire B8A raster (.jp2 or .tiff)
+        scl_pre_path:   (optional) path to pre-fire SCL raster
+        scl_post_path:  (optional) path to post-fire SCL raster
+        sample_n:       number of random pixels for correlation
+        nodata:         nodata value used in clipped tiffs
+
+    Returns:
+        bool: True if images are well-aligned
+    """
+
+    print("\n" + "=" * 70)
+    print("CO-REGISTRATION VALIDATION (v2)")
+    print("=" * 70)
+
+    # ------------------------------------------------------------------
+    # 1. Read B8A bands + metadata
+    # ------------------------------------------------------------------
     with rasterio.open(pre_fire_path) as src_pre:
         b8a_pre = src_pre.read(1).astype("float32")
+        transform_pre = src_pre.transform
+        crs_pre = src_pre.crs
 
     with rasterio.open(post_fire_path) as src_post:
         b8a_post = src_post.read(1).astype("float32")
-    
-    # Check if dimensions match
+        transform_post = src_post.transform
+        crs_post = src_post.crs
+
+    # ------------------------------------------------------------------
+    # 2. Geometric check: transforms + CRS
+    # ------------------------------------------------------------------
+    print("\n--- Geometric Check ---")
+    print(f"  CRS pre : {crs_pre}")
+    print(f"  CRS post: {crs_post}")
+
+    if crs_pre != crs_post:
+        print("  WARNING: CRS mismatch!")
+
+    dx = abs(transform_pre.c - transform_post.c)
+    dy = abs(transform_pre.f - transform_post.f)
+    res_x = abs(transform_pre.a)
+
+    origin_offset_px = np.sqrt(dx**2 + dy**2) / res_x
+
+    print(f"  Pixel size: {res_x}m")
+    print(f"  Origin offset: {origin_offset_px:.4f} pixels")
+
+    if origin_offset_px < 0.01:
+        print("  → Origins match perfectly (same grid)")
+    elif origin_offset_px < 1.0:
+        print("  → Sub-pixel origin offset (acceptable)")
+    else:
+        print(f"  → WARNING: Origin offset {origin_offset_px:.2f} px")
+
     if b8a_pre.shape != b8a_post.shape:
-        print("  ERROR: Image dimensions don't match")
-        print(f" Pre-fire: {b8a_pre.shape}")
-        print(f" Post-fire: {b8a_post.shape}")
+        print(f"  ERROR: Dimensions don't match: {b8a_pre.shape} vs {b8a_post.shape}")
+        print("=" * 70)
+        return False
 
-    print(f" Dimensions match: {b8a_pre.shape}")
+    print(f"  Dimensions: {b8a_pre.shape} ✓")
 
-    # Sampel random pixels
+    # ------------------------------------------------------------------
+    # 3. Build stable-pixel mask
+    # ------------------------------------------------------------------
+    # SCL classes considered stable:
+    #   4 = vegetation, 5 = bare soil, 6 = water
+    STABLE_SCL = {4, 5, 6}
+
     valid_mask = (b8a_pre > 0) & (b8a_post > 0)
+    if nodata is not None:
+        valid_mask &= (b8a_pre != nodata) & (b8a_post != nodata)
+
+    scl_used = False
+
+    if scl_pre_path and scl_post_path:
+        try:
+            with rasterio.open(scl_pre_path) as src:
+                scl_pre = src.read(1)
+            with rasterio.open(scl_post_path) as src:
+                scl_post = src.read(1)
+
+            stable_pre  = np.isin(scl_pre, list(STABLE_SCL))
+            stable_post = np.isin(scl_post, list(STABLE_SCL))
+            stable_mask = valid_mask & stable_pre & stable_post
+
+            n_stable = np.count_nonzero(stable_mask)
+            n_valid  = np.count_nonzero(valid_mask)
+            print(f"\n--- SCL Filtering ---")
+            print(f"  Valid pixels:  {n_valid:,}")
+            print(f"  Stable pixels: {n_stable:,} ({100*n_stable/max(n_valid,1):.1f}%)")
+
+            if n_stable >= sample_n:
+                valid_mask = stable_mask
+                scl_used = True
+            else:
+                print(f"  → Not enough stable pixels ({n_stable} < {sample_n}), using all valid pixels")
+
+        except Exception as e:
+            print(f"  WARNING: Could not read SCL files ({e}), using all valid pixels")
+
+    if not scl_used:
+        print(f"\n  Using all valid pixels: {np.count_nonzero(valid_mask):,}")
+
+    # ------------------------------------------------------------------
+    # 4. Pearson correlation on stable pixels
+    # ------------------------------------------------------------------
     valid_indices = np.where(valid_mask)
 
-    if len(valid_indices[0]) < sample_n:
-        sample_n = len(valid_indices[0])
+    if len(valid_indices[0]) < 10:
+        print("  ERROR: Not enough valid pixels for correlation")
+        print("=" * 70)
+        return False
 
-    sample_idx = np.random.choice(len(valid_indices[0]), sample_n, replace=False)
+    actual_n = min(sample_n, len(valid_indices[0]))
+    sample_idx = np.random.choice(len(valid_indices[0]), actual_n, replace=False)
     sample_rows = valid_indices[0][sample_idx]
     sample_cols = valid_indices[1][sample_idx]
 
-    pre_sample = b8a_pre[sample_rows, sample_cols]
+    pre_sample  = b8a_pre[sample_rows, sample_cols]
     post_sample = b8a_post[sample_rows, sample_cols]
-
-    #Calculate correlation (stable features should correlate)
 
     correlation, p_value = pearsonr(pre_sample, post_sample)
 
-    print(f" \n Correlation Analysis: ({sample_n} sample pixels):")
-    print(f"    Pearson correlation: {correlation:.4f}")
-    print(f"    P-value: {p_value: .2e} ")
+    label = "stable" if scl_used else "valid"
+    print(f"\n--- Correlation Analysis ({actual_n} {label} pixels) ---")
+    print(f"  Pearson r: {correlation:.4f}")
+    print(f"  P-value:   {p_value:.2e}")
+
+    status = True
 
     if correlation > 0.85:
-        print(f" Strong correlation - images well-aligned")
-        status = True
-    
+        print("  → Strong correlation — well-aligned ✓")
     elif correlation > 0.7:
-        print(f" Moderate correlation - check for issues")
-        status= True
-
+        print("  → Moderate correlation — acceptable")
     else:
-        print(f" Weak correlation - co-registration problem!")
-        status= False
+        print("  → Weak correlation — possible co-registration problem")
+        if not scl_used:
+            print("    (Tip: provide SCL paths to exclude burned pixels)")
+        status = False
 
-    #Check spatial offset (cross-correlation)
-    #Sample a small window for efficiency
+    # ------------------------------------------------------------------
+    # 5. Cross-correlation offset
+    # ------------------------------------------------------------------
+    print(f"\n--- Spatial Offset Check ---")
 
     window_size = 256
-    center_row = b8a_pre.shape[0]  // 2
-    center_col = b8a_pre.shape[1] // 2
 
-    window_pre = b8a_pre[
-        center_row:center_row+window_size,
-        center_col:center_col+window_size
-    ]
+    if scl_used:
+        # Find the 256×256 window with the most stable pixels
+        best_count = 0
+        best_r, best_c = b8a_pre.shape[0] // 2, b8a_pre.shape[1] // 2
 
-    window_post = b8a_post[
-        center_row:center_row+window_size,
-        center_col:center_col+window_size
-    ]
+        rows_max = b8a_pre.shape[0] - window_size
+        cols_max = b8a_pre.shape[1] - window_size
 
-    # Simple offset check (should be near zero)
-    xcorr = correlate2d(window_pre, window_post, mode='same')
+        if rows_max > 0 and cols_max > 0:
+            for r_start in np.linspace(0, rows_max, 5, dtype=int):
+                for c_start in np.linspace(0, cols_max, 5, dtype=int):
+                    count = np.count_nonzero(
+                        valid_mask[r_start:r_start+window_size,
+                                   c_start:c_start+window_size]
+                    )
+                    if count > best_count:
+                        best_count = count
+                        best_r, best_c = r_start, c_start
+
+            print(f"  Best window at ({best_r}, {best_c}) with {best_count} stable pixels")
+        else:
+            print(f"  Image too small for {window_size}x{window_size} window")
+            best_r, best_c = 0, 0
+            window_size = min(b8a_pre.shape[0], b8a_pre.shape[1], window_size)
+    else:
+        best_r = min(b8a_pre.shape[0] // 2, b8a_pre.shape[0] - window_size)
+        best_c = min(b8a_pre.shape[1] // 2, b8a_pre.shape[1] - window_size)
+        best_r = max(best_r, 0)
+        best_c = max(best_c, 0)
+
+    window_pre = b8a_pre[best_r:best_r+window_size,
+                          best_c:best_c+window_size]
+    window_post = b8a_post[best_r:best_r+window_size,
+                            best_c:best_c+window_size]
+
+    # Normalize to reduce brightness-change effects
+    def _normalize(arr):
+        a = arr.copy()
+        a[a <= 0] = np.nan
+        mean, std = np.nanmean(a), np.nanstd(a)
+        if std > 0:
+            a = (a - mean) / std
+        return np.nan_to_num(a, nan=0.0)
+
+    xcorr = correlate2d(_normalize(window_pre), _normalize(window_post), mode='same')
     max_loc = np.unravel_index(np.argmax(xcorr), xcorr.shape)
     center = (window_size // 2, window_size // 2)
 
@@ -385,21 +516,28 @@ def validate_coregistration(pre_fire_path, post_fire_path, sample_n=1000):
     offset_col = max_loc[1] - center[1]
     offset_pixels = np.sqrt(offset_row**2 + offset_col**2)
 
-    print(f" \n Spatial Offset Check:")
-    print(f"    Row offset: {offset_row} pixels")
-    print(f"    Col offset: {offset_col} pixels")
-    print(f"    Total offset: {offset_pixels:.2f} pixels")
+    print(f"  Row offset: {offset_row} pixels")
+    print(f"  Col offset: {offset_col} pixels")
+    print(f"  Total offset: {offset_pixels:.2f} pixels")
 
     if offset_pixels < 0.5:
-        print(f" Excellent alignment (<0.5 pixel)")
-
+        print("  → Excellent alignment (<0.5 pixel) ✓")
     elif offset_pixels < 1.0:
-        print(f" Good alignment (<1 pixel)")
-
+        print("  → Good alignment (<1 pixel) ✓")
+    elif offset_pixels < 1.5:
+        print("  → Acceptable for dNBR (<1.5 pixel, within ESA spec)")
     else:
-        print(f" Offset >{offset_pixels:.1f} pixels - may affect dNBR")
+        print(f"  → Offset {offset_pixels:.1f} pixels — may affect dNBR")
         status = False
 
-    print("\n" + "="*70)
-    
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    print("\n" + "-" * 70)
+    print(f"  RESULT: {'ALIGNED ✓' if status else 'MISALIGNED ✗'}")
+    if status and not scl_used and correlation < 0.8:
+        print("  NOTE: Correlation may be low due to fire-induced changes.")
+        print("        Provide SCL paths for a more accurate assessment.")
+    print("=" * 70)
+
     return status

@@ -3,7 +3,7 @@ import geopandas as gpd
 from oauthlib.oauth2 import BackendApplicationClient
 from requests_oauthlib import OAuth2Session
 from secrets import CLIENT_ID, CLIENT_SECRET
-import download
+import download_v2 as download
 
 # -----------------------
 # DIRECTORIES
@@ -121,10 +121,12 @@ for period in ["pre", "post"]:
     PERIODS[period]["bands"] = bands
     PERIODS[period]["clipped"] = clipped
 
-# 6. Validate co-registration (using clipped NIR)
+# 6. Validate co-registration (using clipped NIR + SCL)
 is_aligned = download.validate_coregistration(
     PERIODS["pre"]["clipped"]["B8A"],
     PERIODS["post"]["clipped"]["B8A"],
+    scl_pre_path=PERIODS["pre"]["clipped"]["SCL"],
+    scl_post_path=PERIODS["post"]["clipped"]["SCL"],
 )
 
 if is_aligned:
